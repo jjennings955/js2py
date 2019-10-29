@@ -5,12 +5,16 @@ import distutils.dir_util
 import os
 import pprint
 import esprima
-from pampy import match, _
 import ast
 from ast import *
 
 from esprima.visitor import ToDictVisitor
 
+def ensure_list(l):
+    if isinstance(l, list):
+        return l
+    else:
+        return [l]
 
 def unroll_body(b):
     out = []
@@ -58,11 +62,6 @@ class MyVisitor(ToDictVisitor):
     def transform_StaticMemberExpression(self, node, metadata):
         l = node.object.python_ast
         r = node.property.python_ast
-        if exists(node, '.expression.callee'):
-            out = []
-            for arg in node.expression.arguments[1:]:
-                out.append(arg.python_string)
-            node.python_string = '\n'.join(out)
 
         if node.computed:
             node.python_string = ("{a}[{b}]".format(a=l, b=r))
@@ -76,12 +75,6 @@ class MyVisitor(ToDictVisitor):
     def transform_MemberExpression(self, node, metadata):
         l = node.object.python_ast
         r = node.property.python_ast
-        if exists(node, '.expression.callee'):
-            out = []
-            for arg in node.expression.arguments[1:]:
-                out.append(arg.python_string)
-            node.python_string = '\n'.join(out)
-
         if node.computed:
             node.python_string = ("{a}[{b}]".format(a=l, b=r))
             node.python_ast = Subscript(value=l, slice=Index(value=r, ctx=Load()))
@@ -111,9 +104,16 @@ class MyVisitor(ToDictVisitor):
         return self.transform_FunctionDeclaration(node, params)
 
     def transform_ImportDeclaration(self, node, params):
+        # import foo => Import(names=[alias(name='foo', asname=None)
+        # import foo.bar => Import(names=[alias(name='foo.bar', asname=None)])
+        # from foo import bar => ImportFrom(module='foo', names=[alias(name='bar', asname=None)], level=0)
+        # from foo import * => ImportFrom(module='foo', names=[alias(name='*', asname=None)], level=0)
+        # from foo.bar import bar => ImportFrom(module='foo', names=[alias(name='bar', asname=None)], level=0)
+        # from foo.bar import * => ImportFrom(module='foo.bar', names=[alias(name='*', asname=None)], level=0)
+        # from foo.bar import a, b, c => ImportFrom(module='foo.bar', names=[alias(name='a', asname=None), alias(name='b', asname=None), alias(name='c', asname=None)], level=0)
         node.python_ast = ImportFrom(module=node.source.python_ast.s,
-                                     names=[alias(name=imp.imported.name, asname=None) if
-                                            imp.type == 'ImportSpecifier' else alias(name='*', asname=None) for imp in node.specifiers ], level=0)
+                                     names=[alias(name=imp.imported.name,
+                                                  asname=imp.local.name if (hasattr(imp, 'local') and hasattr(imp.local, 'name') and hasattr(imp, 'imported') and hasattr(imp.imported, 'name') and imp.local.name != imp.imported.name) else None) for imp in node.specifiers ], level=0)
 
         return node
 
@@ -140,9 +140,9 @@ class MyVisitor(ToDictVisitor):
         return node
 
     def transform_ThrowStatement(self, node, params):
-        if node.argument.python_string == 'Error':
-            node.argument.python_string = 'Exception'
-        node.python_ast = Raise(exc=Call(func=Name(id='Exception', ctx=Load()), args=[n.python_ast for n in node.argument.arguments], keywords=[]), cause=None)
+        if node.argument.python_ast.func.id == 'Error':
+            node.argument.python_ast.func.id = 'Exception'
+        node.python_ast = Raise(exc=Call(func=node.argument.python_ast.func, args=[n.python_ast for n in node.argument.arguments], keywords=[]), cause=None)
         return node
 
     def transform_AnonymousFunction(self, node, params):
@@ -150,7 +150,11 @@ class MyVisitor(ToDictVisitor):
         if not isinstance(node.body.python_ast, list):
             node.body.python_ast = [node.body.python_ast]
         num = len(node.body.python_ast)
-        node.body.python_ast[num - 1] = Return(value=node.body.python_ast[num - 1])
+        if num == 0:
+            node.body.python_ast = [Pass()]
+        elif node.type == 'ArrowFunctionExpression' and not (isinstance(node.body.python_ast[num - 1], Return) or isinstance(node.body.python_ast[num - 1], Pass)  or isinstance(node.body.python_ast[num - 1], Yield)):
+            node.body.python_ast[num - 1] = Return(node.body.python_ast[num - 1])
+        #node.body.python_ast[num - 1] = Return(value=node.body.python_ast[num - 1])
         self._funcs["Anonymous" + "_" + str(self.anon_cnt)] = FunctionDef(
             name="Anonymous" + "_" + str(self.anon_cnt),
             args=arguments(args=[arg(arg=argument.name, annotation=None) for argument in
@@ -202,7 +206,7 @@ class MyVisitor(ToDictVisitor):
                             anon = self._funcs[placeholder_name]
                             if real_name == 'constructor':
                                 real_name = '__init__'
-                            self._funcs[placeholder_name].python_ast = None
+
 
                             anon.name = real_name
                             anon.args.args.insert(0, arg(arg='self', annotation=None))
@@ -275,15 +279,15 @@ class MyVisitor(ToDictVisitor):
             func.name = "test_" + test_name
             node.python_ast = func
 
-        if src.startswith("Object.assign"):
+        if src.startswith("Object.assign(") and not src.startswith("Object.assign(Object.create"):
             if isinstance(node.python_ast.args[0], Attribute):
                 class_name = node.python_ast.args[0].value.id
             elif isinstance(node.python_ast.args[0], Name):
                 class_name = node.python_ast.args[0].id
             else:
-                print(ast.dump(node.python_ast.args))
+                pass
+                #print(ast.dump(node.python_ast.args))
 
-            print(class_name)
             class_obj = self._classes.get(class_name, ClassDef(name=class_name, bases=[], decorator_list=[], body=[]))
             self._classes[class_name] = class_obj
 
@@ -295,7 +299,8 @@ class MyVisitor(ToDictVisitor):
                     anon = self._funcs[placeholder_name]
                     if real_name == 'constructor':
                         real_name = '__init__'
-                    self._funcs[placeholder_name].python_ast = None
+                    #self._funcs[placeholder_name].python_ast = None
+                    del self._funcs[placeholder_name]
 
                     anon.name = real_name
 
@@ -335,8 +340,16 @@ class MyVisitor(ToDictVisitor):
         return node
 
     def transform_Program(self, node, metadata):
-        body = list(self._classes.values())
-        body = list(self._funcs.values())
+        body = []
+        for func in list(self._funcs.keys()):
+            if func in self._classes:
+                _func = self._funcs.pop(func)
+                _func.name = '__init__'
+
+                self._classes[func].body.insert(0, _func)
+
+        body.extend(list(self._classes.values()))
+        body.extend(list(self._funcs.values()))
         body.extend(unroll_body(n.python_ast for n in node.body if n != None))
 
         node.python_ast = Module(body=body)
@@ -366,7 +379,7 @@ class MyVisitor(ToDictVisitor):
             body = [node.consequent.python_ast]
         else:
             body = node.consequent.python_ast
-        node.python_ast = If(test=node.test.python_ast, body=unroll_body(body), orelse=[])
+        node.python_ast = If(test=node.test.python_ast, body=unroll_body(body), orelse=ensure_list(node.alternate.python_ast) if node.alternate else [])
 
         return node
 
@@ -396,12 +409,6 @@ class MyVisitor(ToDictVisitor):
         if isinstance(init_ast, type(None)):
             pass
 
-        if hasattr(node.init, 'python_ast'):
-            if isinstance(node.init.python_ast, list):
-                first_target = node.init.python_ast[0].targets[0].id
-            else:
-                first_target = node.init.python_ast.targets[0].id
-
         node.python_ast.append(While(test=test_ast, body=unroll_body([body_ast] + ([node.update.python_ast] if node.update else [])), orelse=[]))
         if len(node.python_ast) == 1:
             node.python_ast = node.python_ast[0]
@@ -410,9 +417,6 @@ class MyVisitor(ToDictVisitor):
         return node
 
     def transform_WhileStatement(self, node, metadata):
-        test_str = node.test.python_string
-
-        body_str = node.body.python_string
         node.python_ast = While(
             test=node.test.python_ast,
             body=unroll_body(node.body.python_ast), orelse=[])
@@ -444,11 +448,10 @@ class MyVisitor(ToDictVisitor):
             'typeof': 'Type',
             'void': UAdd
         }[node.operator]
-        unary = [UAdd, USub, Invert, Not]
 
-        if new_op in unary:
-            node.python_ast = UnaryOp(op=new_op, operand=node.argument.python_ast)
-        if new_op == Delete:
+        if node.operator in ['+', '-', '~', '!']:
+            node.python_ast = UnaryOp(op=new_op(), operand=node.argument.python_ast)
+        elif new_op == Delete:
             node.python_ast = Delete(targets=[node.argument.python_ast])
         else:
             node.python_ast = node.argument.python_ast
@@ -469,7 +472,6 @@ class MyVisitor(ToDictVisitor):
         return node
 
     def transform_YieldExpression(self, node, metadata):
-
         node.python_ast = Yield(value=node.argument.python_ast, ctx=Load())
         return node
 
@@ -484,8 +486,10 @@ class MyVisitor(ToDictVisitor):
         return node
 
     def transform_SwitchStatement(self, node, metadata):
-        node.python_ast = [c.python_ast for c in node.cases]
-
+        node.python_ast = [c.python_ast for c in node.cases if c.test]
+        default = [c.python_ast.body for c in node.cases if not c.test]
+        for n in node.python_ast:
+            n.test = BoolOp(op=Eq(), values=[node.discriminant.python_ast, n.test])
         def merge(n, rest):
             j = 0
             if not n.body:
@@ -493,17 +497,21 @@ class MyVisitor(ToDictVisitor):
                 n.body = rest[j].body
                 j += 1
 
-            if len(rest) > j + 1:
+            if len(rest) > j:
                 n.orelse = [merge(rest[j], rest[j + 1:])]
                 return n
-            if len(rest) == j + 1:
+            elif len(rest) == j+1:
                 n.orelse = [rest[j]]
                 return n
             else:
+                # if default:
+                #     default[0].test = NameConstant(value=True)
                 n.orelse = []
                 return n
 
-        node.python_ast = merge(node.python_ast[0], node.python_ast[1:])
+        node.python_ast = [merge(node.python_ast[0], node.python_ast[1:])]
+        if default:
+            node.python_ast.extend(default[0])
         return node
 
     def transform_ArrowFunctionExpression(self, node, metadata):
@@ -512,9 +520,13 @@ class MyVisitor(ToDictVisitor):
     def transform_ClassDeclaration(self, node, metadata):
         class_obj = ClassDef(name=node.id.name, bases=[], decorator_list=[])
         class_obj.body = []
-        for meth in node.body:
-            class_obj.body.append(meth)
-        node.python_ast = Pass()
+        if len(node.body) > 0:
+            for meth in node.body:
+                class_obj.body.append(meth)
+        else:
+            class_obj.body = [Pass()]
+        self._classes[node.id.name] = class_obj
+        node.python_ast = None
         return node
 
     def transform_ClassBody(self, node, metadata):
@@ -564,7 +576,8 @@ class MyVisitor(ToDictVisitor):
         return node
 
     def transform_CatchClause(self, node, metadata):
-        node.python_ast = ExceptHandler(type=None, body=node.body.python_ast, name=node.param.python_ast.id)
+        exception_type = Name(id='Exception', ctx=Load())
+        node.python_ast = ExceptHandler(type=exception_type, body=node.body.python_ast, name=node.param.python_ast.id)
         return node
 
     def transform_BinaryExpression(self, node, metadata):
@@ -573,8 +586,10 @@ class MyVisitor(ToDictVisitor):
         mapping = {
             'instanceof': Call(func=Name(id='isinstance', ctx=Load()),
                                args=[node.left.python_ast, node.right.python_ast], keywords=[]),
-            'in': Compare(left=node.left.python_ast, ops=[In()],
-                          comparators=[el.python_ast for el in node.right.elements]),
+            'in': Compare(ctx=Load(), left=node.left.python_ast, ops=[In()],
+                          comparators=[List(elts=[el.python_ast for el in node.right.elements])]
+                          if len(node.right.elements) > 1
+                          else [node.right.python_ast]),
             '+': BinOp(left=node.left.python_ast, op=Add(), right=node.right.python_ast),
             '-': BinOp(left=node.left.python_ast, op=Sub(), right=node.right.python_ast),
             '*': BinOp(left=node.left.python_ast, op=Mult(), right=node.right.python_ast),
@@ -617,25 +632,3 @@ def js2py(data, ret='code'):
         return astor.to_source(tree.python_ast)
     else:
         return tree.python_ast
-
-if __name__ == "__main__":
-    files = glob.glob("../../three.py/three.js/src/math/Matrix4.js")
-    print(files)
-    for fname in files:
-        data = open(fname, 'r').read()
-        print("################### {} ###################".format(fname))
-        src = js2py(data)
-        print(src)
-#     tree = transpile_str("""
-#     switch (foo)
-#     {
-#         case 1:
-#             a();
-#             b();
-#         case 2:
-#         case 3:
-#             c();
-#     }
-#     """)
-# #    print(tree)
-#     print(astor.to_source(tree.python_ast))
