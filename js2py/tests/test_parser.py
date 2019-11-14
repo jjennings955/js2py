@@ -16,7 +16,9 @@ class TestMyVisitor(TestCase):
         self.assertEqual(js2py("this.foo"), "self.foo\n")
 
     def test_transform_ExportDefaultDeclaration(self):
-        self.fail()
+        self.assertEqual(js2py("export let name1, name2, nameN;"), "")
+        # self.assertEqual(js2py("x = (function() { console.log('hi'); })()"),
+        #                  "def Anonymous_0():\n    console.log('hi')\n\n\nx = Anonymous_0()\n")
 
     def test_transform_FunctionExpression(self):
         self.assertEqual(js2py("x = function() { console.log('hi'); }"), "def Anonymous_0():\n    console.log('hi')\n\n\nx = Anonymous_0\n")
@@ -26,7 +28,7 @@ class TestMyVisitor(TestCase):
     def test_transform_ImportDeclaration(self):
         self.assertEqual(js2py("import { thing } from \"location\""), "from location import thing\n")
         self.assertEqual(js2py("import { thing1, thing2 } from \"location\""), "from location import thing1, thing2\n")
-        self.assertEqual(js2py("import * as mymod from \"location\""), "import location as mymod\n")
+        self.assertEqual(js2py("import * as mymod from \"location\""), "from location import * as mymod\n")
 
     def test_transform_MetaProperty(self):
         self.skipTest("I don't know what a metaproperty is")
